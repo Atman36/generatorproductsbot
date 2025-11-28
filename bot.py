@@ -638,6 +638,26 @@ async def cmd_generate(message: Message, state: FSMContext):
 async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
     """Возврат в главное меню"""
     await state.clear()
+    
+    # Проверяем, есть ли сообщение после генерации (с клавиатурой after_generation)
+    # Если да - отправляем новое сообщение вместо редактирования, чтобы сохранить результат
+    try:
+        if callback.message.reply_markup and callback.message.reply_markup.inline_keyboard:
+            # Проверяем, есть ли кнопка "Сгенерировать ещё" (признак сообщения после генерации)
+            buttons_text = [btn.text for row in callback.message.reply_markup.inline_keyboard for btn in row]
+            if "🔄 Сгенерировать ещё" in buttons_text:
+                # Это сообщение после генерации - отправляем новое
+                await callback.message.answer(
+                    "🏠 **Главное меню**\n\nВыбери действие:",
+                    reply_markup=get_main_menu_keyboard(),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                await callback.answer()  # Убираем "часики" на кнопке
+                return
+    except:
+        pass
+    
+    # Обычное редактирование для других случаев
     await callback.message.edit_text(
         "🏠 **Главное меню**\n\nВыбери действие:",
         reply_markup=get_main_menu_keyboard(),
@@ -649,6 +669,23 @@ async def cb_generate(callback: CallbackQuery, state: FSMContext):
     """Начало генерации"""
     await state.set_state(IdeaGeneration.waiting_niche)
     
+    # Проверяем, есть ли сообщение после генерации
+    try:
+        if callback.message.reply_markup and callback.message.reply_markup.inline_keyboard:
+            buttons_text = [btn.text for row in callback.message.reply_markup.inline_keyboard for btn in row]
+            if "🔄 Сгенерировать ещё" in buttons_text:
+                # Это сообщение после генерации - отправляем новое
+                await callback.message.answer(
+                    "🎯 **Шаг 1/3: Выбери нишу**\n\nВыбери из списка или введи свою:",
+                    reply_markup=get_niche_keyboard(),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                await callback.answer()
+                return
+    except:
+        pass
+    
+    # Обычное редактирование для других случаев
     await callback.message.edit_text(
         "🎯 **Шаг 1/3: Выбери нишу**\n\nВыбери из списка или введи свою:",
         reply_markup=get_niche_keyboard(),
@@ -684,7 +721,7 @@ async def cb_about(callback: CallbackQuery):
 • Cerebras LLM
 • Python + aiogram
 
-<b>Разработчик:</b> @your_username
+<b>Разработчик:</b> @AleksandrKrasheninnikov
 
 Версия: 1.0.0"""
     
@@ -964,14 +1001,24 @@ async def cb_regenerate(callback: CallbackQuery, state: FSMContext):
         return
     
     await state.set_state(IdeaGeneration.generating)
-    await callback.message.edit_text(
+    
+    # Отправляем НОВОЕ сообщение о генерации вместо редактирования,
+    # чтобы сохранить предыдущий результат
+    status_msg = await callback.message.answer(
         "⏳ **Генерирую новые идеи...**\n\n"
         "Использую те же параметры, но AI сгенерирует другие варианты.",
         parse_mode=ParseMode.MARKDOWN
     )
+    await callback.answer()  # Убираем "часики" на кнопке
     
     result = await llm_client.generate_ideas(session)
     await state.clear()
+    
+    # Удаляем статус-сообщение
+    try:
+        await status_msg.delete()
+    except:
+        pass
     
     processed_result = process_ai_response(result)
     parts = split_long_message(processed_result)
