@@ -10,6 +10,7 @@ from typing import Optional
 from dataclasses import dataclass, field
 from enum import Enum
 import re
+import html
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command, StateFilter
@@ -352,95 +353,173 @@ class LLMClient:
 
 # ============== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==============
 
+def convert_tables_to_lists(text: str) -> str:
+    """
+    Конвертирует Markdown-таблицы в структурированные списки.
+    
+    Пример входа:
+    | № | Название | Описание |
+    |---|----------|----------|
+    | 1 | App1     | Desc1    |
+    
+    Пример выхода:
+    💡 **1 App1**
+    • Описание: Desc1
+    """
+    # Паттерн для таблиц: строки начинающиеся с | и содержащие минимум 2 |
+    table_pattern = r'((?:^\|[^\n]+\|\s*\n?)+)'
+    
+    def process_table(match):
+        table_text = match.group(1)
+        lines = [line.strip() for line in table_text.strip().split('\n') if line.strip()]
+        
+        if len(lines) < 2:
+            return ""
+        
+        # Парсим строки таблицы
+        rows = []
+        for line in lines:
+            line = line.strip('|').strip()
+            # Пропускаем разделители (|---|---|)
+            if re.match(r'^[\s\-:|]+$', line):
+                continue
+            cells = [cell.strip() for cell in line.split('|')]
+            if cells:
+                rows.append(cells)
+        
+        if len(rows) < 2:
+            return ""
+        
+        headers = rows[0]
+        data_rows = rows[1:]
+        
+        # Проверяем, есть ли колонка с номерами
+        has_number_col = len(headers) > 0 and headers[0].lower() in ['№', '#', 'n', 'номер', 'id', '']
+        
+        result_lines = []
+        
+        for row in data_rows:
+            if len(row) < 2:
+                continue
+            
+            if has_number_col and len(row) >= 2:
+                number = row[0]
+                name = row[1] if len(row) > 1 else ""
+                
+                if number:
+                    result_lines.append(f"\n💡 <b>{number} {name}</b>")
+                else:
+                    result_lines.append(f"\n💡 <b>{name}</b>")
+                
+                for i in range(2, len(row)):
+                    if i < len(headers) and row[i].strip():
+                        header_name = headers[i].strip()
+                        value = row[i].strip()
+                        result_lines.append(f"• {header_name}: {value}")
+            else:
+                name = row[0]
+                result_lines.append(f"\n💡 <b>{name}</b>")
+                
+                for i in range(1, len(row)):
+                    if i < len(headers) and row[i].strip():
+                        header_name = headers[i].strip()
+                        value = row[i].strip()
+                        result_lines.append(f"• {header_name}: {value}")
+        
+        return '\n'.join(result_lines) + '\n'
+    
+    return re.sub(table_pattern, process_table, text, flags=re.MULTILINE)
+
+
 def process_ai_response(text: str) -> str:
     """
     Обрабатывает ответ от AI для корректного отображения в Telegram (HTML).
     
-    Основные улучшения:
-    1. Удаление Markdown-таблиц и преобразование их в списки
-    2. Очистка от неподдерживаемых HTML-тегов
-    3. Корректное преобразование Markdown в HTML
-    4. Улучшенная обработка спецсимволов
+    Исправления v2:
+    1. Конвертация Markdown-таблиц в структурированные списки
+    2. Правильная обработка заголовков ## с эмодзи
+    3. Защита code blocks от обработки
+    4. Корректное экранирование HTML внутри code
     """
     if not text:
         return ""
     
-    # ===== ШАГ 1: УДАЛЕНИЕ ТАБЛИЦ =====
-    # Находим и удаляем ASCII/Markdown таблицы
-    # Паттерн для строк таблиц вида: | Cell | Cell | или |---|---|
-    table_pattern = r'\|[^\n]+\|[\s\n]*(?:\|[-:\s]+\|[\s\n]*)?(?:\|[^\n]+\|[\s\n]*)*'
-    text = re.sub(table_pattern, '', text)
+    # ===== ШАГ 0: ПРЕДВАРИТЕЛЬНАЯ ОЧИСТКА =====
+    text = text.replace('\ufeff', '').replace('\u200b', '')
     
-    # Удаляем оставшиеся горизонтальные разделители
-    text = re.sub(r'[-]{3,}', '', text)
+    # ===== ШАГ 1: КОНВЕРТАЦИЯ ТАБЛИЦ В СПИСКИ =====
+    text = convert_tables_to_lists(text)
     
-    # ===== ШАГ 2: ОЧИСТКА HTML =====
-    # Удаляем неподдерживаемые HTML-теги (оставляем только те, что поддерживает Telegram)
-    # Поддерживаемые теги: b, strong, i, em, u, s, strike, del, a, code, pre
-    text = re.sub(r'</?div[^>]*>', '', text)  # Удаляем <div>
-    text = re.sub(r'</?p[^>]*>', '', text)    # Удаляем <p>
-    text = re.sub(r'<br\s*/?>', '\n', text)   # Заменяем <br> на перенос строки
-    text = re.sub(r'</?span[^>]*>', '', text) # Удаляем <span> (кроме tg-spoiler, обработаем отдельно)
+    # ===== ШАГ 2: УДАЛЕНИЕ РАЗДЕЛИТЕЛЕЙ =====
+    text = re.sub(r'(?m)^[-_]{3,}\s*$', '', text)
     
-    # Удаляем все HTML-теги кроме разрешённых
-    allowed_tags = r'(?:b|strong|i|em|u|s|strike|del|a|code|pre)'
-    text = re.sub(r'<(?!/?{0}(?:\s|>)[^>]*>)(?:.|\n)*?>'.format(allowed_tags), '', text)
+    # ===== ШАГ 3: ЗАГОЛОВКИ → HTML (до обработки **) =====
+    def convert_header(match):
+        content = match.group(1).strip()
+        # Убираем ** внутри заголовка (избегаем двойного выделения)
+        content = re.sub(r'\*\*([^*]+)\*\*', r'\1', content)
+        return f'<b>{content}</b>'
     
-    # ===== ШАГ 3: MARKDOWN → HTML =====
-    # Важно: порядок преобразований имеет значение!
+    text = re.sub(r'(?m)^#{1,6}\s+(.+)$', convert_header, text)
     
-    # Code blocks (должны быть обработаны первыми, чтобы не трогать их содержимое)
-    text = re.sub(r'```(.*?)```', r'<pre>\1</pre>', text, flags=re.DOTALL)
+    # ===== ШАГ 4: ЗАЩИТА CODE BLOCKS =====
+    code_blocks = []
+    def save_code_block(match):
+        code_blocks.append(match.group(1))
+        return f'%%CODE_BLOCK_{len(code_blocks)-1}%%'
     
+    text = re.sub(r'```(?:\w+)?\n?(.*?)```', save_code_block, text, flags=re.DOTALL)
+    
+    inline_codes = []
+    def save_inline_code(match):
+        inline_codes.append(match.group(1))
+        return f'%%INLINE_CODE_{len(inline_codes)-1}%%'
+    
+    text = re.sub(r'`([^`\n]+)`', save_inline_code, text)
+    
+    # ===== ШАГ 5: MARKDOWN → HTML =====
     # Bold: **text** или __text__
-    text = re.sub(r'\*\*([^\*]+)\*\*', r'<b>\1</b>', text)
+    text = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'__([^_]+)__', r'<b>\1</b>', text)
     
-    # Italic: *text* или _text_ (но не внутри слов)
-    text = re.sub(r'(?<!\w)\*([^\*\n]+)\*(?!\w)', r'<i>\1</i>', text)
-    text = re.sub(r'(?<!\w)_([^_\n]+)_(?!\w)', r'<i>\1</i>', text)
+    # Italic: *text* или _text_ (не внутри слов/URL)
+    text = re.sub(r'(?<![a-zA-Z0-9*/])\*([^*\n]+)\*(?![a-zA-Z0-9*])', r'<i>\1</i>', text)
+    text = re.sub(r'(?<![a-zA-Z0-9_/])_([^_\n]+)_(?![a-zA-Z0-9_])', r'<i>\1</i>', text)
     
     # Strikethrough: ~~text~~
     text = re.sub(r'~~([^~]+)~~', r'<s>\1</s>', text)
     
-    # Inline code: `code`
-    text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
-    
     # Ссылки: [text](url)
-    text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', text)
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
     
-    # ===== ШАГ 4: СПИСКИ =====
-    # Маркированные списки: - item или * item
+    # ===== ШАГ 6: ВОССТАНОВЛЕНИЕ CODE BLOCKS =====
+    for i, code in enumerate(code_blocks):
+        escaped_code = html.escape(code.strip())
+        text = text.replace(f'%%CODE_BLOCK_{i}%%', f'<pre>{escaped_code}</pre>')
+    
+    for i, code in enumerate(inline_codes):
+        escaped_code = html.escape(code)
+        text = text.replace(f'%%INLINE_CODE_{i}%%', f'<code>{escaped_code}</code>')
+    
+    # ===== ШАГ 7: СПИСКИ =====
     text = re.sub(r'(?m)^\s*[-*]\s+', '• ', text)
     
-    # ===== ШАГ 5: ЗАГОЛОВКИ =====
-    # ### Heading → <b>Heading</b>
-    text = re.sub(r'(?m)^####\s+(.+)$', r'<b>\1</b>', text)
-    text = re.sub(r'(?m)^###\s+(.+)$', r'<b>\1</b>', text)
-    text = re.sub(r'(?m)^##\s+(.+)$', r'<b>\1</b>', text)
-    text = re.sub(r'(?m)^#\s+(.+)$', r'<b>\1</b>', text)
-    
-    # ===== ШАГ 6: ДОПОЛНИТЕЛЬНЫЕ УЛУЧШЕНИЯ =====
+    # ===== ШАГ 8: ДОПОЛНИТЕЛЬНЫЕ УЛУЧШЕНИЯ =====
     # Удаляем лишние пробелы перед знаками препинания
     text = re.sub(r'\s+([.,!?:;])', r'\1', text)
     
     # Форматирование чисел: 10000 → 10 000
     def format_numbers(match):
         num_str = match.group(0)
-        # Не форматируем годы и короткие числа
         if len(num_str) >= 5:
             return '{:,}'.format(int(num_str)).replace(',', ' ')
         return num_str
     
     text = re.sub(r'\b\d{5,}\b', format_numbers, text)
     
-    # ===== ШАГ 7: ОЧИСТКА =====
-    # Удаляем множественные переносы строк (больше 2 подряд)
+    # ===== ШАГ 9: ОЧИСТКА =====
     text = re.sub(r'\n{3,}', '\n\n', text)
-    
-    # Удаляем пробелы в начале и конце строк
-    lines = [line.rstrip() for line in text.split('\n')]
-    text = '\n'.join(lines)
+    text = re.sub(r'[ \t]+$', '', text, flags=re.MULTILINE)
     
     return text.strip()
 
