@@ -9,6 +9,7 @@ import asyncio
 from typing import Optional
 from dataclasses import dataclass, field
 from enum import Enum
+import re
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command, StateFilter
@@ -75,7 +76,8 @@ SYSTEM_PROMPT = """Ты — профессиональный продукт-ме
 - Используй эмодзи для структурирования
 - Адаптируй сложность под указанный бюджет
 - Если бюджет маленький — предлагай более простые решения
-- Если бюджет большой — предлагай более амбициозные идеи"""
+- Если бюджет большой — предлагай более амбициозные идеи
+- ВАЖНО: НЕ используй таблицы (ASCII tables), так как они плохо отображаются в Telegram. Используй маркированные списки и выделение жирным."""
 
 # ============== ДАННЫЕ И КОНСТАНТЫ ==============
 
@@ -332,6 +334,84 @@ class LLMClient:
         except Exception as e:
             logger.error(f"LLM Error: {e}")
             return f"❌ Произошла ошибка при генерации: {str(e)}\n\nПопробуйте ещё раз или обратитесь к разработчику."
+
+
+# ============== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==============
+
+def process_ai_response(text: str) -> str:
+    """
+    Обрабатывает ответ от AI для форматирования в Telegram (HTML).
+    """
+    if not text:
+        return ""
+        
+    # Удаляем HTML-теги, которые могут вызывать проблемы (оставляем только поддерживаемые)
+    text = re.sub(r'<(?!/?(?:b|strong|i|em|u|s|a|code|pre)[^>]*>)(?:.|\n)*?>', '', text)
+    
+    # Обработка спойлеров
+    text = re.sub(r'\|\|(.*?)\|\|', r'<span class="tg-spoiler">\1</span>', text)
+    
+    # Стандартные преобразования Markdown в HTML
+    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)  # Bold
+    text = re.sub(r'\*([^*]+)\*', r'<i>\1</i>', text)    # Italic
+    text = re.sub(r'__([^_]+)__', r'<u>\1</u>', text)    # Underline
+    text = re.sub(r'~~([^~]+)~~', r'<s>\1</s>', text)    # Strikethrough
+    text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text) # Inline code
+    text = re.sub(r'```(.*?)```', r'<pre>\1</pre>', text, flags=re.DOTALL) # Code blocks
+    
+    # Ссылки [text](url) -> <a href="url">text</a>
+    text = re.sub(r'\[(.*?)\]\((.*?)\)', r'<a href="\2">\1</a>', text)
+    
+    # Списки
+    text = re.sub(r'(?m)^\s*-\s', '• ', text)
+    
+    # Заголовки ### -> <b>
+    text = re.sub(r'(?m)^###\s*(.*?)$', r'<b>\1</b>', text)
+    text = re.sub(r'(?m)^##\s*(.*?)$', r'<b>\1</b>', text)
+    
+    return text.strip()
+
+def split_long_message(text: str, max_length: int = 4000) -> list[str]:
+    """
+    Умное разбиение длинного сообщения на части
+    """
+    if len(text) <= max_length:
+        return [text]
+        
+    parts = []
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    current_part = ""
+    
+    for sentence in sentences:
+        if len(current_part) + len(sentence) <= max_length:
+            current_part += sentence + " "
+        else:
+            if current_part:
+                parts.append(current_part.strip())
+            current_part = sentence + " "
+    
+    if current_part:
+        parts.append(current_part.strip())
+    
+    # Если какое-то предложение оказалось длиннее max_length, разделим его жестко
+    final_parts = []
+    for part in parts:
+        if len(part) > max_length:
+            # Разбиваем по словам
+            words = part.split()
+            current_subpart = ""
+            for word in words:
+                if len(current_subpart) + len(word) + 1 <= max_length:
+                    current_subpart += word + " "
+                else:
+                    final_parts.append(current_subpart.strip())
+                    current_subpart = word + " "
+            if current_subpart:
+                final_parts.append(current_subpart.strip())
+        else:
+            final_parts.append(part)
+            
+    return final_parts
 
 # ============== ИНИЦИАЛИЗАЦИЯ ==============
 
@@ -720,24 +800,19 @@ async def cb_confirm_generate(callback: CallbackQuery, state: FSMContext):
     # Отправляем результат (может быть длинным)
     await state.clear()
     
-    # Разбиваем на части, если слишком длинный
-    if len(result) > 4000:
-        parts = [result[i:i+4000] for i in range(0, len(result), 4000)]
-        for i, part in enumerate(parts):
-            if i == len(parts) - 1:
-                await callback.message.answer(
-                    part,
-                    reply_markup=get_after_generation_keyboard(),
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            else:
-                await callback.message.answer(part, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await callback.message.edit_text(
-            result,
-            reply_markup=get_after_generation_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
+    # Обработка и отправка результата
+    processed_result = process_ai_response(result)
+    parts = split_long_message(processed_result)
+    
+    for i, part in enumerate(parts):
+        if i == len(parts) - 1:
+            await callback.message.answer(
+                part,
+                reply_markup=get_after_generation_keyboard(),
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await callback.message.answer(part, parse_mode=ParseMode.HTML)
 
 @router.callback_query(F.data == "regenerate")
 async def cb_regenerate(callback: CallbackQuery, state: FSMContext):
@@ -758,23 +833,18 @@ async def cb_regenerate(callback: CallbackQuery, state: FSMContext):
     result = await llm_client.generate_ideas(session)
     await state.clear()
     
-    if len(result) > 4000:
-        parts = [result[i:i+4000] for i in range(0, len(result), 4000)]
-        for i, part in enumerate(parts):
-            if i == len(parts) - 1:
-                await callback.message.answer(
-                    part,
-                    reply_markup=get_after_generation_keyboard(),
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            else:
-                await callback.message.answer(part, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await callback.message.edit_text(
-            result,
-            reply_markup=get_after_generation_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
+    processed_result = process_ai_response(result)
+    parts = split_long_message(processed_result)
+    
+    for i, part in enumerate(parts):
+        if i == len(parts) - 1:
+            await callback.message.answer(
+                part,
+                reply_markup=get_after_generation_keyboard(),
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await callback.message.answer(part, parse_mode=ParseMode.HTML)
 
 # ============== FALLBACK HANDLERS ==============
 
