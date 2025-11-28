@@ -1,0 +1,8 @@
+# Telegram Bot
+aiogram==3.13.1
+
+# Cerebras LLM
+cerebras-cloud-sdk>=1.0.0
+
+# Utils
+python-dotenv==1.0.1
